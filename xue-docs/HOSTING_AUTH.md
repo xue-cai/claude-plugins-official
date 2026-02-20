@@ -393,6 +393,351 @@ docker run -it --rm \
   claude-sandbox
 ```
 
+### Credential Lifecycle: Obtain → Store → Inject → Rotate
+
+The table above helps you decide **which approach** to use. This section explains **how to manage credentials** through their full lifecycle for each approach.
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌──────────┐
+│ OBTAIN   │───▶│  STORE   │───▶│   INJECT     │───▶│  ROTATE  │
+│          │    │          │    │              │    │          │
+│ Create   │    │ Secret   │    │ Env vars →   │    │ Schedule │
+│ tokens / │    │ manager  │    │ Claude Code  │    │ or on-   │
+│ accounts │    │ or vault │    │ / Docker     │    │ demand   │
+└──────────┘    └──────────┘    └──────────────┘    └──────────┘
+```
+
+#### Step 1: Obtain Credentials
+
+How you create/get credentials differs by approach and data source:
+
+**For shared service accounts:**
+
+| Data Source | How to Create Credentials | What You Get |
+|-------------|--------------------------|-------------|
+| **Internal REST API** | Create a service account in your API management platform with read-only scope | API key or bearer token |
+| **Production DB** | Create a read-only database user: `CREATE USER claude_readonly WITH PASSWORD '...' LOGIN; GRANT SELECT ON ALL TABLES IN SCHEMA public TO claude_readonly;` | Username + password or connection string |
+| **Knowledge base** (Confluence, Notion) | Create a service integration / API token in admin settings with read-only permissions | API token |
+| **Chat platform** (Slack, Intercom) | Create a bot user or app with `read` scopes only | Bot token or OAuth client credentials |
+| **Email** (Gmail, Exchange) | Create a service account with domain-wide delegation (Google) or application permissions (Microsoft) | Service account JSON key or client secret |
+| **CRM** (Salesforce, HubSpot) | Create a connected app / private app with limited scopes | Client ID + secret, or API key |
+
+**For per-user credentials:**
+
+| Data Source | How to Create Credentials | What You Get |
+|-------------|--------------------------|-------------|
+| **Internal REST API** | Each user generates their own personal API token from the service's developer settings | Personal API token per user |
+| **CRM** (Salesforce, HubSpot) | Each user connects via OAuth; token stored per session | Per-user OAuth tokens (managed by Claude Code for auto-OAuth servers) |
+| **Production DB** | Create per-user read-only DB users (or use IAM-based DB auth): `CREATE USER jane_readonly WITH PASSWORD '...' LOGIN; GRANT SELECT ON ALL TABLES TO jane_readonly;` | Per-user connection strings |
+| **SaaS with OAuth** | Auto OAuth — Claude Code handles per-user auth automatically when user first invokes a tool | Per-user tokens stored by Claude Code |
+
+> **Tip**: For OAuth-based SaaS services (Salesforce, HubSpot, Zendesk, Jira), you may not need to manage credentials at all. If the MCP server supports auto OAuth, Claude Code handles per-user authentication automatically — just provide the URL in `.mcp.json`.
+
+#### Step 2: Store Credentials
+
+**Never store credentials in:**
+- Docker images / Dockerfiles
+- Git repositories
+- Plaintext files on shared filesystems
+- Environment variables in shell profiles that get committed
+
+**Use a secret manager:**
+
+| Cloud Provider | Secret Manager | CLI to Retrieve |
+|---------------|---------------|-----------------|
+| **AWS** | AWS Secrets Manager | `aws secretsmanager get-secret-value --secret-id <name> --query SecretString --output text` |
+| **GCP** | Google Secret Manager | `gcloud secrets versions access latest --secret=<name>` |
+| **Azure** | Azure Key Vault | `az keyvault secret show --vault-name <vault> --name <name> --query value -o tsv` |
+| **Self-hosted** | HashiCorp Vault | `vault kv get -field=value secret/<path>` |
+
+**Organizing secrets in your secret manager:**
+
+```
+# Shared credentials (one set for the hosted instance)
+customer360/shared/kb-api-token
+customer360/shared/chat-api-token
+customer360/shared/email-api-token
+customer360/shared/db-readonly-url        # postgresql://claude_readonly:***@replica:5432/prod
+
+# Per-user credentials (one set per user)
+customer360/users/jane/crm-token
+customer360/users/jane/db-user
+customer360/users/bob/crm-token
+customer360/users/bob/db-user
+```
+
+**Example: Storing credentials in AWS Secrets Manager:**
+
+```bash
+# Store a shared credential
+aws secretsmanager create-secret \
+  --name "customer360/shared/kb-api-token" \
+  --secret-string "your-kb-api-token-here" \
+  --description "Read-only knowledge base API token for Customer 360"
+
+# Store a per-user credential
+aws secretsmanager create-secret \
+  --name "customer360/users/jane/crm-token" \
+  --secret-string "jane-specific-crm-token" \
+  --description "Jane's CRM API token for Customer 360"
+```
+
+#### Step 3: Inject Credentials into Claude Code
+
+Credentials must arrive as environment variables when Claude Code starts. The `.mcp.json` references them with `${VAR_NAME}` syntax, and Claude Code expands them at connection time.
+
+**Method A: Startup script fetches from secret manager (recommended)**
+
+Create a launcher script that fetches secrets and passes them to Docker:
+
+```bash
+#!/bin/bash
+# launch-customer360.sh — Called when a user starts their session
+
+USER=$1  # e.g., "jane"
+
+# Fetch shared credentials from secret manager
+KB_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "customer360/shared/kb-api-token" \
+  --query SecretString --output text)
+
+CHAT_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "customer360/shared/chat-api-token" \
+  --query SecretString --output text)
+
+EMAIL_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "customer360/shared/email-api-token" \
+  --query SecretString --output text)
+
+DB_URL=$(aws secretsmanager get-secret-value \
+  --secret-id "customer360/shared/db-readonly-url" \
+  --query SecretString --output text)
+
+# Fetch per-user credentials
+CRM_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "customer360/users/$USER/crm-token" \
+  --query SecretString --output text)
+
+USER_EMAIL="$USER@yourcompany.com"
+
+# Launch Claude Code with all credentials injected
+docker run -it --rm \
+  -e ANTHROPIC_API_KEY \
+  -e KB_API_TOKEN="$KB_TOKEN" \
+  -e CHAT_API_TOKEN="$CHAT_TOKEN" \
+  -e EMAIL_API_TOKEN="$EMAIL_TOKEN" \
+  -e PROD_DB_READ_REPLICA_URL="$DB_URL" \
+  -e CRM_API_TOKEN="$CRM_TOKEN" \
+  -e USER_EMAIL="$USER_EMAIL" \
+  -e COMPANY_TENANT_ID="acme-corp" \
+  -v "/home/$USER/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+**Method B: Docker with secret manager sidecar (for Kubernetes)**
+
+```yaml
+# kubernetes-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: claude-customer360-jane
+spec:
+  serviceAccountName: claude-customer360
+  containers:
+    - name: claude-sandbox
+      image: claude-sandbox:latest
+      env:
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: claude-api-key
+              key: api-key
+        # Shared credentials from Kubernetes secrets
+        - name: KB_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: customer360-shared
+              key: kb-api-token
+        - name: CHAT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: customer360-shared
+              key: chat-api-token
+        # Per-user credential from user-specific secret
+        - name: CRM_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: customer360-jane
+              key: crm-token
+```
+
+**Method C: GCP — fetch from Secret Manager at startup**
+
+```bash
+#!/bin/bash
+# launch-customer360-gcp.sh
+
+USER=$1
+
+# Shared credentials
+KB_TOKEN=$(gcloud secrets versions access latest --secret=customer360-shared-kb-token)
+CHAT_TOKEN=$(gcloud secrets versions access latest --secret=customer360-shared-chat-token)
+
+# Per-user credentials
+CRM_TOKEN=$(gcloud secrets versions access latest --secret=customer360-${USER}-crm-token)
+
+docker run -it --rm \
+  -e CLAUDE_CODE_USE_VERTEX=1 \
+  -e CLOUD_ML_REGION=us-east5 \
+  -e ANTHROPIC_VERTEX_PROJECT_ID=your-project-id \
+  -e KB_API_TOKEN="$KB_TOKEN" \
+  -e CHAT_API_TOKEN="$CHAT_TOKEN" \
+  -e CRM_API_TOKEN="$CRM_TOKEN" \
+  -v "/home/$USER/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+**Method D: Azure — fetch from Key Vault at startup**
+
+```bash
+#!/bin/bash
+# launch-customer360-azure.sh
+
+USER=$1
+
+# Shared credentials
+KB_TOKEN=$(az keyvault secret show --vault-name customer360 --name shared-kb-token --query value -o tsv)
+CHAT_TOKEN=$(az keyvault secret show --vault-name customer360 --name shared-chat-token --query value -o tsv)
+
+# Per-user credentials
+CRM_TOKEN=$(az keyvault secret show --vault-name customer360 --name "${USER}-crm-token" --query value -o tsv)
+
+docker run -it --rm \
+  -e CLAUDE_CODE_USE_FOUNDRY=1 \
+  -e ANTHROPIC_FOUNDRY_RESOURCE=your-resource-name \
+  -e KB_API_TOKEN="$KB_TOKEN" \
+  -e CHAT_API_TOKEN="$CHAT_TOKEN" \
+  -e CRM_API_TOKEN="$CRM_TOKEN" \
+  -v "/home/$USER/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+#### Step 4: Rotate Credentials
+
+Credential rotation strategies depend on the credential type:
+
+| Credential Type | Rotation Strategy | Frequency | Automation |
+|----------------|-------------------|-----------|------------|
+| **API tokens** (shared service accounts) | Generate new token → update secret manager → restart sessions | Every 90 days | Secret manager auto-rotation |
+| **API tokens** (per-user) | Each user regenerates their own token → admin updates secret manager | Every 90 days, or on-demand | User-initiated + admin script |
+| **Database passwords** | Rotate via secret manager auto-rotation → restart connections | Every 30–90 days | Secret manager auto-rotation |
+| **OAuth tokens** (auto OAuth) | Claude Code handles refresh automatically — no manual rotation needed | Automatic | Built-in |
+| **Service account keys** (GCP JSON keys) | Generate new key → update secret → delete old key | Every 90 days | GCP recommends Workload Identity Federation instead |
+| **Client certificates** (mTLS) | Issue new cert → update secret manager → restart | Before expiry | PKI automation / cert-manager |
+
+**Automated rotation with AWS Secrets Manager:**
+
+```bash
+# Enable auto-rotation for a shared credential (every 90 days)
+aws secretsmanager rotate-secret \
+  --secret-id "customer360/shared/kb-api-token" \
+  --rotation-lambda-arn arn:aws:lambda:us-east-1:111122223333:function:rotate-api-token \
+  --rotation-rules '{"AutomaticallyAfterDays": 90}'
+```
+
+The rotation Lambda function should:
+1. Call the service API to generate a new token
+2. Update the secret in Secrets Manager
+3. (Optional) Notify affected sessions to restart
+
+**Manual rotation script (for any cloud provider):**
+
+```bash
+#!/bin/bash
+# rotate-shared-credentials.sh
+# Run on a schedule (cron) or on-demand
+
+echo "Rotating Customer 360 shared credentials..."
+
+# 1. Generate new KB token (call your service's API)
+NEW_KB_TOKEN=$(curl -s -X POST https://kb.internal/api/tokens \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -d '{"name": "customer360-readonly", "scope": "read"}' | jq -r '.token')
+
+# 2. Update secret manager
+aws secretsmanager put-secret-value \
+  --secret-id "customer360/shared/kb-api-token" \
+  --secret-string "$NEW_KB_TOKEN"
+
+# 3. Revoke old token (service-specific)
+curl -s -X DELETE https://kb.internal/api/tokens/${OLD_TOKEN_ID} \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}"
+
+echo "✅ KB token rotated. Active sessions will use new token on next restart."
+
+# 4. (Optional) Signal running sessions to restart
+# This depends on your orchestration — e.g., rolling restart of Docker containers
+```
+
+**Per-user credential rotation workflow:**
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Admin sends rotation reminder to users                  │
+│  (email / Slack / automated notification)                │
+├──────────────────────────────────────────────────────────┤
+│  Each user:                                              │
+│  1. Generates new personal API token from the service    │
+│  2. Runs: update-my-credentials.sh <new-token>          │
+│     (script updates their secret in the secret manager)  │
+├──────────────────────────────────────────────────────────┤
+│  User's next Claude Code session picks up new credential │
+│  (fetched from secret manager at startup)                │
+├──────────────────────────────────────────────────────────┤
+│  Admin verifies all users have rotated (check timestamps │
+│  in secret manager) and revokes overdue tokens           │
+└──────────────────────────────────────────────────────────┘
+```
+
+**User-facing rotation script:**
+
+```bash
+#!/bin/bash
+# update-my-credentials.sh — Run by each user
+# Usage: ./update-my-credentials.sh <new-crm-token>
+
+USER=$(whoami)
+NEW_CRM_TOKEN=$1
+
+if [ -z "$NEW_CRM_TOKEN" ]; then
+  echo "Usage: $0 <new-crm-token>"
+  echo "Get your new token from: https://crm.yourcompany.com/settings/api-tokens"
+  exit 1
+fi
+
+# Update in secret manager
+aws secretsmanager put-secret-value \
+  --secret-id "customer360/users/$USER/crm-token" \
+  --secret-string "$NEW_CRM_TOKEN"
+
+echo "✅ CRM token updated. It will take effect on your next Claude Code session."
+echo "   To apply immediately, restart your session."
+```
+
+**For OAuth-based services (no manual rotation needed):**
+
+When an MCP server uses auto OAuth (Pattern 1 — just a URL in `.mcp.json`), Claude Code manages the entire token lifecycle:
+- Tokens are obtained automatically when the user first uses the MCP tool
+- Refresh tokens are used to get new access tokens before they expire
+- Users re-authorize if the refresh token expires or scopes change
+- No admin intervention needed — this is the easiest approach
+
+This is why **OAuth-based MCP servers are strongly preferred** for per-user access when available. If your internal service can implement an OAuth 2.0 / MCP-compatible auth flow, it eliminates all credential management overhead.
+
 ### Security Best Practices for Hosted MCP Connections
 
 1. **Always use a read-only replica** for production database connections — never connect the MCP server to the primary/write DB
