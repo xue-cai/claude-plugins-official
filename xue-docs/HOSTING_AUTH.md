@@ -1,12 +1,12 @@
 # Hosting Claude Code as a Service — Authentication
 
-> **Scenario**: You host Claude Code in a cloud sandbox (Docker container, cloud VM, or managed service) and want colleagues to use it. How should authentication be configured?
+> **Scenario**: You host Claude Code in a cloud sandbox (Docker container, cloud VM, or managed service) and want colleagues to use it — possibly connected to company data sources like a knowledge base, CRM, email, chat history, or production database. How should authentication be configured?
 
-This is a different layer from MCP server authentication (covered in [PLUGIN_ANALYSIS.md](./PLUGIN_ANALYSIS.md#mcp-server-authentication)). MCP auth controls how plugins connect to external services (Stripe, GitHub, etc.). **Hosting auth** controls how Claude Code itself authenticates with the underlying AI model provider, and how users access the hosted instance.
+This document covers three layers of authentication: how users access the hosted instance (Layer 1), how Claude Code authenticates with the AI model provider (Layer 2), and how the hosted instance authenticates with your company's MCP servers and data sources (Layer 3). For MCP auth patterns in the plugin ecosystem more broadly, see [PLUGIN_ANALYSIS.md](./PLUGIN_ANALYSIS.md#mcp-server-authentication).
 
-## Two Authentication Layers
+## Three Authentication Layers
 
-When hosting Claude Code for a team, there are **two distinct auth layers** to configure:
+When hosting Claude Code for a team with connected data sources, there are **three distinct auth layers** to configure:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -17,6 +17,10 @@ When hosting Claude Code for a team, there are **two distinct auth layers** to c
 │  Layer 2: CLAUDE CODE → AI MODEL PROVIDER           │
 │  (How Claude Code calls the LLM)                    │
 │  API key, IAM role, OAuth, or service account       │
+├─────────────────────────────────────────────────────┤
+│  Layer 3: CLAUDE CODE → MCP SERVERS (DATA SOURCES)  │
+│  (How Claude Code connects to your company services)│
+│  OAuth, Bearer tokens, env vars, service accounts   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -194,3 +198,325 @@ How your colleagues actually reach the hosted Claude Code instance:
 2. Configure backend auth (Bedrock/Vertex/Foundry) via env vars
 3. Provide SSH or web terminal access to each colleague
 4. Use separate state volumes per user for session isolation
+
+---
+
+## Layer 3: MCP Server Authentication for Company Data Sources
+
+This is the layer most relevant when building a **domain-specific assistant** — connecting your hosted Claude Code instance to internal company services via MCP (Model Context Protocol) servers.
+
+### The Architecture
+
+```
+                           ┌─────────────────────────────────┐
+                           │     HOSTED CLAUDE CODE          │
+                           │     (Docker / VM / Cloud)       │
+                           │                                 │
+                           │  ┌───────────────────────────┐  │
+  Users ──SSH/Web──────────┤  │  .mcp.json                │  │
+                           │  │  (defines all MCP servers) │  │
+                           │  └──────┬──┬──┬──┬──┬────────┘  │
+                           └─────────┼──┼──┼──┼──┼───────────┘
+                                     │  │  │  │  │
+                    ┌────────────────┘  │  │  │  └──────────────────┐
+                    │         ┌────────┘  │  └────────┐            │
+                    ▼         ▼           ▼           ▼            ▼
+              ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+              │Knowledge │ │  Chat    │ │  Email   │ │Production│ │  CRM /   │
+              │Base MCP  │ │ History  │ │ History  │ │   DB     │ │ Tickets  │
+              │ Server   │ │ MCP Srv  │ │ MCP Srv  │ │ MCP Srv  │ │ MCP Srv  │
+              └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘
+                 (HTTP)       (HTTP)       (HTTP)      (stdio)      (HTTP)
+```
+
+### Example: Customer 360 Assistant
+
+Suppose you want a hosted Claude Code instance that acts as a **Customer 360 assistant** — answering questions about any customer by pulling data from multiple internal systems:
+
+- **Knowledge base** — Company wiki/docs (Confluence, Notion, or custom)
+- **Chat history** — Customer conversations (Intercom, Zendesk, or internal)
+- **Email history** — Customer email threads (Gmail API, Exchange, or custom)
+- **Production DB** — Customer records, orders, subscriptions (PostgreSQL, MySQL)
+- **CRM / Tickets** — Salesforce, HubSpot, or internal ticketing
+
+#### The `.mcp.json` Configuration
+
+Place this file in the hosted Claude Code instance's working directory or in a plugin's root:
+
+```json
+{
+  "knowledge-base": {
+    "type": "http",
+    "url": "https://mcp.internal.yourcompany.com/knowledge",
+    "headers": {
+      "Authorization": "Bearer ${KB_API_TOKEN}",
+      "X-Tenant-ID": "${COMPANY_TENANT_ID}"
+    }
+  },
+  "chat-history": {
+    "type": "http",
+    "url": "https://mcp.internal.yourcompany.com/chat",
+    "headers": {
+      "Authorization": "Bearer ${CHAT_API_TOKEN}"
+    }
+  },
+  "email-history": {
+    "type": "http",
+    "url": "https://mcp.internal.yourcompany.com/email",
+    "headers": {
+      "Authorization": "Bearer ${EMAIL_API_TOKEN}"
+    }
+  },
+  "production-db": {
+    "command": "python",
+    "args": ["-m", "mcp_server_postgres"],
+    "env": {
+      "DATABASE_URL": "${PROD_DB_READ_REPLICA_URL}",
+      "DB_USER": "${PROD_DB_USER}",
+      "DB_PASSWORD": "${PROD_DB_PASSWORD}",
+      "READ_ONLY": "true"
+    }
+  },
+  "crm": {
+    "type": "http",
+    "url": "https://mcp.internal.yourcompany.com/crm",
+    "headers": {
+      "Authorization": "Bearer ${CRM_API_TOKEN}",
+      "X-User-Email": "${USER_EMAIL}"
+    }
+  }
+}
+```
+
+#### Environment Variables to Set
+
+On the hosted instance, set these before starting Claude Code:
+
+```bash
+# Knowledge base
+export KB_API_TOKEN="your-kb-service-token"
+export COMPANY_TENANT_ID="acme-corp"
+
+# Chat history
+export CHAT_API_TOKEN="your-chat-service-token"
+
+# Email history
+export EMAIL_API_TOKEN="your-email-service-token"
+
+# Production database (read replica!)
+export PROD_DB_READ_REPLICA_URL="postgresql://readonly-replica.internal:5432/production"
+export PROD_DB_USER="claude_readonly"
+export PROD_DB_PASSWORD="from-secrets-manager"
+
+# CRM
+export CRM_API_TOKEN="your-crm-service-token"
+export USER_EMAIL="analyst@yourcompany.com"
+```
+
+#### Docker Configuration for Multi-MCP
+
+When running in Docker, pass all MCP credentials as environment variables:
+
+```bash
+docker run -it --rm \
+  -e ANTHROPIC_API_KEY \
+  -e KB_API_TOKEN \
+  -e COMPANY_TENANT_ID \
+  -e CHAT_API_TOKEN \
+  -e EMAIL_API_TOKEN \
+  -e PROD_DB_READ_REPLICA_URL \
+  -e PROD_DB_USER \
+  -e PROD_DB_PASSWORD \
+  -e CRM_API_TOKEN \
+  -e USER_EMAIL \
+  -v "$(pwd)/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+Or use a `.env` file (keep out of git!):
+
+```bash
+docker run -it --rm \
+  --env-file .env.customer360 \
+  -v "$(pwd)/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+### MCP Auth Patterns for Internal Services
+
+Depending on your internal infrastructure, choose the auth pattern that fits each data source:
+
+| Data Source Type | Recommended MCP Auth | Transport | Configuration |
+|-----------------|---------------------|-----------|--------------|
+| **Internal API with OAuth** (e.g., Confluence Cloud, Google Workspace) | Auto OAuth — just provide URL | HTTP/SSE | `{ "type": "http", "url": "https://mcp.service.com/mcp" }` |
+| **Internal API with tokens** (e.g., custom REST services, Elasticsearch) | Bearer token via `${ENV_VAR}` | HTTP | `{ "headers": { "Authorization": "Bearer ${TOKEN}" } }` |
+| **Internal API with API keys** (e.g., custom microservices) | Custom headers via `${ENV_VAR}` | HTTP | `{ "headers": { "X-API-Key": "${API_KEY}" } }` |
+| **Database** (PostgreSQL, MySQL, MongoDB) | Env vars passed to stdio server | stdio | `{ "command": "python", "args": ["-m", "mcp_server_db"], "env": { "DATABASE_URL": "${DB_URL}" } }` |
+| **Service behind VPN** | stdio server running locally in the sandbox | stdio | Server process runs inside Docker with VPN access |
+| **Service requiring mTLS** | stdio wrapper with client certs | stdio | `{ "command": "mtls-wrapper", "args": ["--cert", "${CLIENT_CERT}"] }` |
+| **Service with short-lived tokens** | `headersHelper` script generates fresh tokens | HTTP/SSE | `{ "headersHelper": "./scripts/get-fresh-token.sh" }` |
+| **SaaS with OAuth** (Salesforce, HubSpot, Zendesk) | Auto OAuth or explicit OAuth | HTTP/SSE | URL only, or `{ "oauth": { "clientId": "...", "callbackPort": 3118 } }` |
+
+### Per-User vs Shared MCP Credentials
+
+A critical decision for hosted instances: should each user have their own MCP credentials, or should the instance use shared service accounts?
+
+| Approach | How It Works | Pros | Cons |
+|----------|-------------|------|------|
+| **Shared service account** | One set of credentials for all users | Simple setup; one `.env` file | No per-user audit trail; overly broad access |
+| **Per-user credentials** | Each user's env vars loaded at session start | Full audit trail; least-privilege per user | More complex setup; credential management overhead |
+| **Hybrid** | Shared for read-only sources; per-user for write access | Balanced security and simplicity | Need clear policy on which sources are shared |
+
+**Recommended for Customer 360**: Use the **hybrid** approach:
+- **Shared read-only** credentials for knowledge base, chat history, email history (read-only API tokens)
+- **Per-user** credentials for CRM and production DB (where writes or sensitive queries are possible)
+- **Read-only database user** always — never give the MCP server write access to production
+
+#### Per-User MCP Setup with Docker
+
+```bash
+# User-specific env file loaded at login
+cat > /home/$USER/.env.mcp << 'EOF'
+CRM_API_TOKEN=user-specific-crm-token
+USER_EMAIL=jane@yourcompany.com
+EOF
+
+# Start Claude Code with user's MCP credentials
+docker run -it --rm \
+  --env-file /shared/.env.customer360-shared \
+  --env-file /home/$USER/.env.mcp \
+  -e ANTHROPIC_API_KEY \
+  -v "/home/$USER/.claude-state:/home/sandbox/state" \
+  -v "$(pwd)/workspace:/home/sandbox/workspace" \
+  claude-sandbox
+```
+
+### Security Best Practices for Hosted MCP Connections
+
+1. **Always use a read-only replica** for production database connections — never connect the MCP server to the primary/write DB
+   ```bash
+   # ✅ Read replica
+   export PROD_DB_READ_REPLICA_URL="postgresql://readonly-replica.internal:5432/production"
+   # ❌ Never the primary
+   # export PROD_DB_URL="postgresql://primary.internal:5432/production"
+   ```
+
+2. **Scope tokens to minimum permissions** — Create dedicated API tokens for each MCP server with only the permissions it needs
+   ```
+   Knowledge Base: read-only access to articles
+   Chat History: read-only access to conversations
+   Email: read-only access to threads (no send permission!)
+   CRM: read + limited write (e.g., add notes, not delete contacts)
+   ```
+
+3. **Use your cloud provider's secret management** — Don't store credentials in Docker images, env files on disk, or code
+   ```bash
+   # ✅ Fetch from AWS Secrets Manager at startup
+   export PROD_DB_PASSWORD=$(aws secretsmanager get-secret-value \
+     --secret-id customer360/db-password --query SecretString --output text)
+
+   # ✅ Fetch from GCP Secret Manager
+   export PROD_DB_PASSWORD=$(gcloud secrets versions access latest \
+     --secret=customer360-db-password)
+
+   # ✅ Fetch from Azure Key Vault
+   export PROD_DB_PASSWORD=$(az keyvault secret show \
+     --vault-name customer360 --name db-password --query value -o tsv)
+   ```
+
+4. **Network isolation** — Run MCP servers on an internal network; the hosted Claude Code instance should access them over VPN/VPC, not the public internet
+   ```bash
+   # Docker with host network (access internal services)
+   docker run --network=host ...
+
+   # Or Docker with a custom bridge connected to internal services
+   docker run --network=internal-services ...
+   ```
+
+5. **Audit MCP tool usage** — Log which MCP tools are called, with what arguments, and by which user. Claude Code's `--debug` mode shows MCP calls; route this to your logging infrastructure
+
+6. **Rotate credentials on a schedule** — MCP tokens should be rotated just like any API credential. Use short-lived tokens where possible (`headersHelper` for dynamic token generation)
+
+7. **Restrict MCP tools in commands** — Use `allowed-tools` in command frontmatter to control which MCP tools each workflow can access:
+   ```markdown
+   ---
+   allowed-tools: [
+     "mcp__knowledge-base__search_articles",
+     "mcp__chat-history__get_conversations",
+     "mcp__crm__get_customer"
+   ]
+   ---
+   # Don't allow: mcp__production-db__execute_query (too broad)
+   ```
+
+### Building Your Own MCP Server for Internal Data
+
+If your company data sources don't have existing MCP servers, you'll need to build them. The MCP protocol is straightforward:
+
+**Option 1: Use an existing MCP server package**
+
+| Data Source | MCP Server Package | Transport |
+|-------------|-------------------|-----------|
+| PostgreSQL | `mcp-server-postgres` (Python), `@modelcontextprotocol/server-postgres` (Node) | stdio |
+| MySQL | `mcp-server-mysql` | stdio |
+| SQLite | `@modelcontextprotocol/server-sqlite` | stdio |
+| Filesystem | `@modelcontextprotocol/server-filesystem` | stdio |
+| Elasticsearch | `mcp-server-elasticsearch` | stdio |
+| Redis | `mcp-server-redis` | stdio |
+
+**Option 2: Build a custom MCP server** (for internal APIs)
+
+Use the [MCP SDK](https://modelcontextprotocol.io/) to wrap your internal API:
+
+```python
+# Example: Custom knowledge base MCP server
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+
+server = Server("knowledge-base")
+
+@server.tool()
+async def search_articles(query: str, limit: int = 10) -> list[TextContent]:
+    """Search the company knowledge base for articles matching the query."""
+    results = await your_kb_api.search(query, limit=limit)
+    return [TextContent(type="text", text=format_result(r)) for r in results]
+
+@server.tool()
+async def get_article(article_id: str) -> TextContent:
+    """Get the full content of a knowledge base article by ID."""
+    article = await your_kb_api.get(article_id)
+    return TextContent(type="text", text=article.content)
+```
+
+**Option 3: Use an HTTP proxy** — Expose your internal REST API as an MCP HTTP server using a generic MCP-to-REST adapter.
+
+### Complete Customer 360 Setup Checklist
+
+Here's a step-by-step checklist for setting up a hosted Claude Code instance as a Customer 360 assistant:
+
+- [ ] **Layer 2**: Choose and configure an AI model backend (Bedrock, Vertex, Foundry, or Anthropic direct)
+- [ ] **Layer 3 — MCP servers**:
+  - [ ] Identify all data sources needed (KB, chat, email, DB, CRM)
+  - [ ] For each source: choose MCP server (existing package or custom)
+  - [ ] For each source: create a dedicated service account / API token with minimum permissions
+  - [ ] Write `.mcp.json` with all MCP servers configured
+  - [ ] Create environment variable documentation for operators
+- [ ] **Security**:
+  - [ ] Use read-only replicas for databases
+  - [ ] Store all credentials in secret manager (not in env files or Docker images)
+  - [ ] Set up network access (VPN/VPC) for internal services
+  - [ ] Configure `allowed-tools` to restrict which MCP tools each workflow can access
+  - [ ] Set up audit logging for MCP tool calls
+  - [ ] Establish credential rotation schedule
+- [ ] **Layer 1**: Configure user access (SSH, web terminal, or VS Code Remote)
+- [ ] **Per-user isolation**:
+  - [ ] Decide shared vs per-user MCP credentials for each source
+  - [ ] Create per-user env files for user-specific credentials
+  - [ ] Mount separate `.claude-state` volumes per user
+- [ ] **Testing**:
+  - [ ] Test each MCP server connection individually
+  - [ ] Test a cross-source query (e.g., "Tell me everything about customer X")
+  - [ ] Verify read-only access to production DB
+  - [ ] Verify audit logs capture MCP tool usage
