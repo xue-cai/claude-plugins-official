@@ -9,16 +9,17 @@
 1. [What Is a Claude Code Plugin?](#what-is-a-claude-code-plugin)
 2. [Plugin Anatomy — Building Blocks](#plugin-anatomy--building-blocks)
 3. [How Claude Code Uses Plugins](#how-claude-code-uses-plugins)
-4. [Plugin Deep-Dives](#plugin-deep-dives)
+4. [MCP Server Authentication](#mcp-server-authentication)
+5. [Plugin Deep-Dives](#plugin-deep-dives)
    - [Agent SDK Dev](#1-agent-sdk-dev)
    - [Vercel](#2-vercel)
    - [Notion](#3-notion)
    - [Plugin Developer Toolkit](#4-plugin-developer-toolkit-plugin-dev)
    - [Stripe](#5-stripe)
    - [Firebase](#6-firebase)
-5. [Additional Notable Plugins](#additional-notable-plugins)
-6. [AWS / GCP / Azure Plugin Availability](#aws--gcp--azure-plugin-availability)
-7. [Plugin Catalog Summary](#plugin-catalog-summary)
+6. [Additional Notable Plugins](#additional-notable-plugins)
+7. [AWS / GCP / Azure Plugin Availability](#aws--gcp--azure-plugin-availability)
+8. [Plugin Catalog Summary](#plugin-catalog-summary)
 
 ---
 
@@ -116,6 +117,245 @@ A **full-featured plugin** (e.g., Plugin Dev Toolkit) can have dozens of files a
 - **`@file-path`** — File reference syntax to include file contents in command prompts
 - **`!`command``** — Inline bash execution in command prompts
 - **`allowed-tools`** — Frontmatter field to restrict which tools a command/agent can use
+
+---
+
+## MCP Server Authentication
+
+MCP servers in this plugin ecosystem use four distinct authentication patterns. The method depends on the server transport type (stdio, HTTP, SSE) and how the external service manages credentials.
+
+### Authentication Patterns at a Glance
+
+| Pattern | Transport | How It Works | Plugins Using It |
+|---------|-----------|-------------|-----------------|
+| **OAuth (automatic)** | HTTP / SSE | Claude Code opens a browser for OAuth consent on first use; tokens are stored and auto-refreshed | Slack, Supabase, Stripe, Linear, GitLab, Asana |
+| **Bearer token (headers)** | HTTP | Environment variable expanded into `Authorization` header | GitHub, Greptile |
+| **Explicit OAuth config** | HTTP | OAuth fields declared in `.mcp.json` with `clientId` and `callbackPort` | Slack |
+| **Environment variables (stdio)** | stdio | Credentials passed to the child process via `env` field | Firebase (via local CLI auth), Context7, Playwright, Serena, Laravel Boost |
+
+### Pattern 1: OAuth (Automatic) — Most Common
+
+The majority of HTTP/SSE plugins declare **only a URL** — no auth fields at all. Claude Code handles the entire OAuth 2.0 flow automatically:
+
+```json
+// Supabase — no auth config, OAuth is automatic
+{
+  "supabase": {
+    "type": "http",
+    "url": "https://mcp.supabase.com/mcp"
+  }
+}
+
+// Stripe — same pattern (note: nested under mcpServers key)
+{
+  "mcpServers": {
+    "stripe": {
+      "type": "http",
+      "url": "https://mcp.stripe.com"
+    }
+  }
+}
+
+// Linear
+{
+  "linear": {
+    "type": "http",
+    "url": "https://mcp.linear.app/mcp"
+  }
+}
+
+// GitLab
+{
+  "gitlab": {
+    "type": "http",
+    "url": "https://gitlab.com/api/v4/mcp"
+  }
+}
+
+// Asana (SSE transport)
+{
+  "asana": {
+    "type": "sse",
+    "url": "https://mcp.asana.com/sse"
+  }
+}
+```
+
+**How the flow works:**
+1. User invokes an MCP tool (e.g., a Stripe or Supabase tool)
+2. Claude Code detects that authentication is needed
+3. A browser window opens with the service's OAuth consent page
+4. User authorizes the application
+5. Claude Code receives and stores the tokens securely (encrypted at rest)
+6. Tokens are auto-refreshed on expiry — no user action needed
+7. Users can clear tokens by signing out
+
+**Plugins using this pattern:** Supabase, Stripe, Linear, GitLab, Asana, and the example-plugin.
+
+### Pattern 2: Bearer Token via Headers
+
+Some plugins require users to set an environment variable containing an API token. The `${VAR_NAME}` syntax in `.mcp.json` is expanded at runtime:
+
+```json
+// GitHub — requires GITHUB_PERSONAL_ACCESS_TOKEN env var
+{
+  "github": {
+    "type": "http",
+    "url": "https://api.githubcopilot.com/mcp/",
+    "headers": {
+      "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+  }
+}
+
+// Greptile — requires GREPTILE_API_KEY env var
+{
+  "greptile": {
+    "type": "http",
+    "url": "https://api.greptile.com/mcp",
+    "headers": {
+      "Authorization": "Bearer ${GREPTILE_API_KEY}"
+    }
+  }
+}
+```
+
+**How it works:**
+1. User sets the environment variable in their shell (e.g., `export GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."`)
+2. When Claude Code starts the MCP connection, it expands `${GITHUB_PERSONAL_ACCESS_TOKEN}` to the actual value
+3. The token is sent as an HTTP `Authorization: Bearer <token>` header on every request
+4. If the variable is unset, the connection fails with an auth error
+
+**When to use this pattern:** When the service doesn't support OAuth or when the user needs a personal access token with specific scopes.
+
+### Pattern 3: Explicit OAuth Configuration
+
+Slack is the only plugin in this repository that declares OAuth parameters explicitly in `.mcp.json`:
+
+```json
+// Slack — explicit OAuth with clientId and callbackPort
+{
+  "slack": {
+    "type": "http",
+    "url": "https://mcp.slack.com/mcp",
+    "oauth": {
+      "clientId": "1601185624273.8899143856786",
+      "callbackPort": 3118
+    }
+  }
+}
+```
+
+**How it differs from Pattern 1:**
+- The `oauth` object provides a specific `clientId` (the Slack app ID) and a `callbackPort` (the local port for the OAuth redirect)
+- This tells Claude Code exactly which OAuth application to use and where to listen for the callback
+- Pattern 1 relies on the MCP server itself to advertise its OAuth configuration; Pattern 3 puts it in the plugin config
+
+### Pattern 4: Environment Variables for stdio Servers
+
+stdio-based MCP servers run as local child processes. Authentication is handled by the local tool's existing auth mechanism (e.g., `firebase login`), not by Claude Code:
+
+```json
+// Firebase — runs local CLI, relies on `firebase login` auth
+{
+  "firebase": {
+    "command": "npx",
+    "args": ["-y", "firebase-tools@latest", "mcp"]
+  }
+}
+
+// Context7 — no auth needed (public documentation lookup)
+{
+  "context7": {
+    "command": "npx",
+    "args": ["-y", "@upstash/context7-mcp"]
+  }
+}
+
+// Playwright — no auth needed (local browser automation)
+{
+  "playwright": {
+    "command": "npx",
+    "args": ["@playwright/mcp@latest"]
+  }
+}
+```
+
+**How it works:**
+- Claude Code spawns the process and communicates via stdin/stdout
+- The child process inherits the user's environment (including any pre-authenticated CLI sessions)
+- For Firebase: the user runs `firebase login` separately, and the MCP server uses those cached credentials
+- For tools like Playwright and Context7: no authentication is needed at all
+
+**When credentials are needed**, they're passed via the `env` field:
+```json
+{
+  "database": {
+    "command": "python",
+    "args": ["-m", "mcp_server_db"],
+    "env": {
+      "DATABASE_URL": "${DATABASE_URL}",
+      "DB_PASSWORD": "${DB_PASSWORD}"
+    }
+  }
+}
+```
+
+### Advanced Authentication Patterns
+
+The plugin-dev skill documents additional patterns not yet used by plugins in this repository but supported by the framework:
+
+| Pattern | How It Works | Use Case |
+|---------|-------------|----------|
+| **Dynamic headers** (`headersHelper`) | A shell script generates fresh headers on each request | Short-lived tokens, HMAC signatures, JWT generation |
+| **API key headers** | Custom header names like `X-API-Key` | Services that don't use Bearer token convention |
+| **Multi-tenant headers** | `X-Workspace-ID` or tenant-specific URLs | SaaS platforms with workspace isolation |
+| **mTLS wrapper** | A stdio server wraps an mTLS-authenticated connection | Enterprise services requiring client certificates |
+
+Example of a `headersHelper` script:
+```json
+{
+  "api": {
+    "type": "sse",
+    "url": "https://api.example.com",
+    "headersHelper": "${CLAUDE_PLUGIN_ROOT}/scripts/get-headers.sh"
+  }
+}
+```
+
+### Security Best Practices
+
+Based on the patterns in this repository and the plugin-dev documentation:
+
+| ✅ Do | ❌ Don't |
+|-------|---------|
+| Use `${ENV_VAR}` for all tokens/secrets | Hardcode tokens in `.mcp.json` |
+| Prefer OAuth when the service supports it | Store credentials in plugin files |
+| Use HTTPS/WSS for all remote connections | Use HTTP/WS in production |
+| Document required env vars in README | Commit `.env` files to git |
+| Pre-allow specific MCP tools, not wildcards | Use `allowed-tools: ["mcp__*"]` |
+| Let Claude Code manage OAuth token storage | Implement custom token storage |
+
+### Complete .mcp.json Auth Catalog
+
+Every `.mcp.json` in this repository, classified by auth method:
+
+| Plugin | File | Transport | Auth Method | Config |
+|--------|------|-----------|-------------|--------|
+| **Slack** | `external_plugins/slack/.mcp.json` | HTTP | Explicit OAuth | `oauth: { clientId, callbackPort }` |
+| **GitHub** | `external_plugins/github/.mcp.json` | HTTP | Bearer token | `headers.Authorization: "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"` |
+| **Greptile** | `external_plugins/greptile/.mcp.json` | HTTP | Bearer token | `headers.Authorization: "Bearer ${GREPTILE_API_KEY}"` |
+| **Supabase** | `external_plugins/supabase/.mcp.json` | HTTP | Auto OAuth | URL only |
+| **Stripe** | `external_plugins/stripe/.mcp.json` | HTTP | Auto OAuth | URL only |
+| **Linear** | `external_plugins/linear/.mcp.json` | HTTP | Auto OAuth | URL only |
+| **GitLab** | `external_plugins/gitlab/.mcp.json` | HTTP | Auto OAuth | URL only |
+| **Asana** | `external_plugins/asana/.mcp.json` | SSE | Auto OAuth | URL only |
+| **Firebase** | `external_plugins/firebase/.mcp.json` | stdio | Local CLI auth | `npx firebase-tools` |
+| **Context7** | `external_plugins/context7/.mcp.json` | stdio | None needed | `npx @upstash/context7-mcp` |
+| **Playwright** | `external_plugins/playwright/.mcp.json` | stdio | None needed | `npx @playwright/mcp` |
+| **Serena** | `external_plugins/serena/.mcp.json` | stdio | None needed | `uvx serena` |
+| **Laravel Boost** | `external_plugins/laravel-boost/.mcp.json` | stdio | None needed | `php artisan boost:mcp` |
+| **example-plugin** | `plugins/example-plugin/.mcp.json` | HTTP | Auto OAuth | URL only (example) |
 
 ---
 
